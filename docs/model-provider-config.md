@@ -76,19 +76,28 @@ OPENCODE 模型（Anthropic Messages 族）：模型名 => opencode-anthropic:cl
 **本地 Ollama**：无需新 provider，覆盖 base_url 即可
 `OLLAMA_BASE_URL=http://localhost:11434/v1`，key 任意值（Ollama 忽略）。
 
-**env 覆盖**（每 provider 一组，全部可缺省）：
+**env 覆盖**（每 provider 一组，全部可缺省）。两条规则：
+
+1. **空字符串环境变量等于「未设置」**，回落到字段默认值（纯空格同理）。因此 URL 类变量**不要**写成 `FOO=` 空赋值 —— 那会把真实默认值清空，`cp .env.example .env` 就会踩到。下表用注释形式给出规范值，需要改端点时才取消注释。
+2. 默认值本来就是 `""` 的变量（两个 API key、`ANTHROPIC_BASE_URL`）留空赋值无害：它们没有默认值可丢。
+
 ```
-DEFAULT_PROVIDER=anthropic            # 无前缀时用哪个
-OLLAMA_BASE_URL=
-OLLAMA_API_KEY=
-OLLAMA_STRUCTURED_OUTPUT=json_mode    # native | json_mode | prompt_only
-OLLAMA_PRICING_MODE=unknown           # per_token | subscription | unknown
-OPENCODE_BASE_URL=
-OPENCODE_API_KEY=                    # opencode 与 opencode-anthropic 共用
+DEFAULT_PROVIDER=anthropic                      # 无前缀时用哪个
+# OLLAMA_BASE_URL=https://ollama.com/v1         # 本地 Ollama 改成 http://localhost:11434/v1
+# OLLAMA_ANTHROPIC_BASE_URL=https://ollama.com  # ollama-anthropic 族，与 ollama 共用同一把 key
+OLLAMA_API_KEY=                                 # 空赋值无害：key 无默认值可丢
+OLLAMA_STRUCTURED_OUTPUT=json_mode              # native | json_mode | prompt_only
+OLLAMA_PRICING_MODE=unknown                     # per_token | subscription | unknown
+# OPENCODE_BASE_URL=https://opencode.ai/inference/openai/v1
+# OPENCODE_ANTHROPIC_BASE_URL=https://opencode.ai/inference/anthropic
+OPENCODE_API_KEY=                               # opencode 与 opencode-anthropic 共用
 OPENCODE_STRUCTURED_OUTPUT=prompt_only
 OPENCODE_PRICING_MODE=subscription
-ANTHROPIC_BASE_URL=                   # 可选：把 Anthropic SDK 指到任意 anthropic_messages 兼容端点
+# OPENAI_BASE_URL=https://api.openai.com/v1     # 仅影响 openai provider 的对话调用；embeddings 仍直连 OpenAI
+ANTHROPIC_BASE_URL=                             # 例外：默认即「让 SDK 自己选端点」，空赋值正确
 ```
+
+第二族的两个 `*_ANTHROPIC_BASE_URL` 属于「同 key 不同端点」：`ollama` / `opencode` 读各自的开源族 URL，`ollama-anthropic` / `opencode-anthropic` 读 `*_ANTHROPIC_BASE_URL`，key 共用一份。
 
 ## 5. 传输层
 
