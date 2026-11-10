@@ -288,18 +288,20 @@ def test_client_endpoints_come_from_env_overrides(monkeypatch: pytest.MonkeyPatc
 def test_empty_base_url_falls_back_to_the_provider_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`cp .env.example .env` can leave a base_url as "", which must mean "unset".
+    """An empty base_url must mean "unset", so the client still gets a real endpoint.
 
-    An empty string is a valid pydantic value, so nothing downstream may assume the
-    field default survived: fall back to the capability table's canonical URL.
+    Settings drops blank values, so the value is forced past validation here: the
+    guard has to survive a Settings built elsewhere, a future field whose default is
+    "", and any code that assigns the attribute directly.
     """
-    _settings(
-        monkeypatch,
-        ollama_base_url="",
-        opencode_base_url="",
-        ollama_anthropic_base_url="",
-        opencode_anthropic_base_url="",
-    )
+    _settings(monkeypatch)
+    for field in (
+        "ollama_base_url",
+        "opencode_base_url",
+        "ollama_anthropic_base_url",
+        "opencode_anthropic_base_url",
+    ):
+        monkeypatch.setattr(providers.settings, field, "")
 
     assert str(providers.get_openai_client("ollama").base_url).rstrip("/") == "https://ollama.com/v1"
     assert (
@@ -314,14 +316,16 @@ def test_empty_base_url_falls_back_to_the_provider_default(
 
 
 def test_whitespace_only_base_url_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    _settings(monkeypatch, ollama_base_url="   ")
+    _settings(monkeypatch)
+    monkeypatch.setattr(providers.settings, "ollama_base_url", "   ")
 
     assert str(providers.get_openai_client("ollama").base_url).rstrip("/") == "https://ollama.com/v1"
 
 
 def test_empty_anthropic_base_url_keeps_the_sdk_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     """Anthropic's "" is the exception: pass no base_url and let the SDK choose."""
-    _settings(monkeypatch, anthropic_base_url="")
+    _settings(monkeypatch)
+    monkeypatch.setattr(providers.settings, "anthropic_base_url", "")
 
     assert str(providers.get_anthropic_client("anthropic").base_url) == "https://api.anthropic.com"
 
