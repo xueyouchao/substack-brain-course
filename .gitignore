@@ -32,3 +32,6 @@ htmlcov/
 
 # Archives
 *.zip
+
+# Agent scratch space (local tickets, not shared)
+.scratch/
