@@ -2,8 +2,10 @@
 
 The seams under test are `resolve_model` and `call_llm`: every assertion goes
 through those public entry points, so the internal resolution helpers and client
-singletons can be rewritten without touching this file. HTTP is intercepted with
-respx, so the suite needs neither the network nor a real API key.
+singletons can be rewritten without touching this file. No request leaves the
+process: the SDK client is replaced with a recorder before it can dial out, which
+matters because the pinned anthropic/openai builds speak httpx2 and would escape
+respx entirely. The suite needs neither the network nor a real API key.
 """
 
 from __future__ import annotations
