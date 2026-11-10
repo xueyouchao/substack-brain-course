@@ -160,11 +160,13 @@ schema 注入文本统一由 `_schema_instruction(schema) -> str` 生成，附�
 
 ## 9. 测试计划
 
-用仓库已有的 `respx`，默认**不联网、不需要真 key**：
+默认**不联网、不需要真 key**。
+
+> **实现更正（T2 实证，本 spec 原方案有误）**：本仓 pin 的 `anthropic==1.7.0` / `openai==3.16.2` 走 `httpx2`，而 `respx` 只 patch `httpx` —— 用 respx 拦这两个 SDK 会**漏到真实网络**（探针实测打到了 api.anthropic.com 并拿到真 401）。且 `respx` 在本仓库的 Python 文件里**从未被使用**，只是 dev 依赖里躺着。因此实际测试改用：monkeypatch `providers.get_anthropic_client` / `get_openai_client` 注入记录型假 client 断言请求 kwargs，并直接断言真实 client 的 `base_url` / `api_key` 钉住路由。
 
 1. `test_resolve_model`：无前缀→默认 provider；`ollama:gemma4:31b` 切成 `ollama`/`gemma4:31b`；`opencode:glm-5.3`；未知前缀抛出且错误信息含已知 provider 列表。
 2. `test_anthropic_native_still_emits_output_config`：**向后兼容护栏** — 无前缀模型必须仍发 `output_config.format.type == "json_schema"`。
-3. `test_openai_chat_native` / `test_ollama_json_mode` / `test_opencode_prompt_only`：respx 拦 `/chat/completions`，断言 `response_format` 三档差异与 schema 注入仅在非 native 档出现。
+3. `test_openai_chat_native` / `test_ollama_json_mode` / `test_opencode_prompt_only`：注入假 openai client 捕获 `chat.completions.create` 的 kwargs，断言 `response_format` 三档差异与 schema 注入仅在非 native 档出现。
 4. `test_base_url_and_auth_header`：Ollama → `https://ollama.com/v1` + `Bearer`；OpenCode → `https://opencode.ai/inference/openai/v1`。
 5. `test_subscription_cost_is_zero_and_flagged`：`est_usd == 0.0` 且 `usage["pricing_mode"] == "subscription"`。
 6. `test_usage_dict_shape`：4 个必填键恒在（守住 `CostCaptureMiddleware` 契约）。
