@@ -137,6 +137,11 @@ class Settings(BaseSettings):
     opencode_api_key: str = ""
     opencode_structured_output: Literal["native", "json_mode", "prompt_only"] = "prompt_only"
     opencode_pricing_mode: Literal["per_token", "subscription", "unknown"] = "subscription"
+    # The Go subscription ingress (…/inference/go/openai/v1) answers
+    # 400 MissingSessionID unless the request carries x-opencode-session. Blank
+    # means "generate one per process": that satisfies the routing hint without
+    # asking the user to invent an id.
+    opencode_session: str = ""
 
     @model_validator(mode="before")
     @classmethod

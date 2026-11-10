@@ -252,6 +252,27 @@ def _pricing_mode(resolved: ResolvedModel) -> str:
     return _setting_or_default(spec.pricing_setting, spec.default_pricing)
 
 
+_generated_opencode_session: str = ""
+
+
+def _client_headers(provider: str) -> dict[str, str]:
+    """Headers the OpenCode ingress demands; empty for every other provider.
+
+    Two documented requirements: the Go endpoint answers 400 MissingSessionID
+    without x-opencode-session, and its docs ask clients to identify themselves
+    with their own User-Agent rather than a generic SDK name.
+    """
+    if not provider.startswith("opencode"):
+        return {}
+    global _generated_opencode_session
+    session = settings.opencode_session.strip()
+    if not session:
+        if not _generated_opencode_session:
+            _generated_opencode_session = uuid.uuid4().hex
+        session = _generated_opencode_session
+    return {"x-opencode-session": session, "User-Agent": settings.user_agent}
+
+
 def get_anthropic_client(provider: str) -> anthropic.AsyncAnthropic:
     """Return the cached `AsyncAnthropic` client for a provider and its base_url."""
     spec = PROVIDERS[provider]
@@ -259,10 +280,14 @@ def get_anthropic_client(provider: str) -> anthropic.AsyncAnthropic:
     cache_key = (provider, base_url)
     client = _anthropic_clients.get(cache_key)
     if client is None:
+        key = _api_key(provider, spec)
+        headers = _client_headers(provider)
         if base_url:
-            client = anthropic.AsyncAnthropic(api_key=_api_key(provider, spec), base_url=base_url)
+            client = anthropic.AsyncAnthropic(
+                api_key=key, base_url=base_url, default_headers=headers
+            )
         else:
-            client = anthropic.AsyncAnthropic(api_key=_api_key(provider, spec))
+            client = anthropic.AsyncAnthropic(api_key=key, default_headers=headers)
         _anthropic_clients[cache_key] = client
     return client
 
@@ -274,10 +299,12 @@ def get_openai_client(provider: str) -> openai.AsyncOpenAI:
     cache_key = (provider, base_url)
     client = _openai_clients.get(cache_key)
     if client is None:
+        key = _api_key(provider, spec)
+        headers = _client_headers(provider)
         if base_url:
-            client = openai.AsyncOpenAI(api_key=_api_key(provider, spec), base_url=base_url)
+            client = openai.AsyncOpenAI(api_key=key, base_url=base_url, default_headers=headers)
         else:
-            client = openai.AsyncOpenAI(api_key=_api_key(provider, spec))
+            client = openai.AsyncOpenAI(api_key=key, default_headers=headers)
         _openai_clients[cache_key] = client
     return client
 

@@ -673,3 +673,75 @@ async def test_openai_pricing_mode_env_override_reaches_the_cost_row(
     assert result["usage"]["pricing_mode"] == "subscription"
     assert result["usage"]["est_usd"] == 0.0
 
+
+
+# --- OpenCode Go ingress headers (kb/agents/providers.py::_client_headers) ---
+
+
+def test_opencode_client_identifies_itself_as_this_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Go ingress answers 400 MissingSessionID without x-opencode-session.
+
+    Its docs also ask clients to send their own User-Agent rather than a generic
+    SDK name, so both headers have to be set by us.
+    """
+    _settings(monkeypatch)
+
+    headers = dict(providers.get_openai_client("opencode").default_headers)
+
+    assert headers["x-opencode-session"]
+    assert headers["User-Agent"] == providers.settings.user_agent
+    assert "AsyncOpenAI" not in headers["User-Agent"]
+
+
+def test_opencode_anthropic_client_sends_the_same_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _settings(monkeypatch)
+
+    openai_family = dict(providers.get_openai_client("opencode").default_headers)
+    anthropic_family = dict(providers.get_anthropic_client("opencode-anthropic").default_headers)
+
+    assert anthropic_family["x-opencode-session"] == openai_family["x-opencode-session"]
+    assert anthropic_family["User-Agent"] == providers.settings.user_agent
+
+
+def test_configured_session_is_sent_verbatim(monkeypatch: pytest.MonkeyPatch) -> None:
+    _settings(monkeypatch, opencode_session="my-conversation-id")
+
+    headers = dict(providers.get_openai_client("opencode").default_headers)
+
+    assert headers["x-opencode-session"] == "my-conversation-id"
+
+
+def test_other_providers_carry_no_opencode_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _settings(monkeypatch)
+
+    for provider in ("anthropic", "openai", "ollama", "ollama-anthropic"):
+        spec = providers.PROVIDERS[provider]
+        client = (
+            providers.get_openai_client(provider)
+            if spec.api_family == "openai_chat"
+            else providers.get_anthropic_client(provider)
+        )
+        assert "x-opencode-session" not in dict(client.default_headers), provider
+
+
+def test_generated_session_does_not_change_between_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One opaque id per process: the ingress treats it as a routing hint."""
+    _settings(monkeypatch)
+    monkeypatch.setattr(providers, "_generated_opencode_session", "")
+
+    first = dict(providers.get_openai_client("opencode").default_headers)["x-opencode-session"]
+    monkeypatch.setattr(providers, "_openai_clients", {})
+    second = dict(providers.get_openai_client("opencode").default_headers)["x-opencode-session"]
+
+    assert first == second
+    assert isinstance(first, str)
+    assert len(first) >= 16
+
