@@ -18,6 +18,8 @@ PROVIDER_SURFACE_DEFAULTS: dict[str, str] = {
     "default_provider": "anthropic",
     "anthropic_base_url": "",
     "openai_base_url": "https://api.openai.com/v1",
+    "openai_structured_output": "native",
+    "openai_pricing_mode": "per_token",
     "ollama_base_url": "https://ollama.com/v1",
     "ollama_anthropic_base_url": "https://ollama.com",
     "ollama_api_key": "",
@@ -30,8 +32,12 @@ PROVIDER_SURFACE_DEFAULTS: dict[str, str] = {
     "opencode_pricing_mode": "subscription",
 }
 
-STRUCTURED_OUTPUT_FIELDS = ("ollama_structured_output", "opencode_structured_output")
-PRICING_MODE_FIELDS = ("ollama_pricing_mode", "opencode_pricing_mode")
+STRUCTURED_OUTPUT_FIELDS = (
+    "openai_structured_output",
+    "ollama_structured_output",
+    "opencode_structured_output",
+)
+PRICING_MODE_FIELDS = ("openai_pricing_mode", "ollama_pricing_mode", "opencode_pricing_mode")
 
 
 @pytest.fixture(autouse=True)

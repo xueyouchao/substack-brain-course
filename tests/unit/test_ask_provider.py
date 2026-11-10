@@ -60,6 +60,26 @@ class _FakeMessagesAPI:
         return self._response
 
 
+class _FakeCompletionsAPI:
+    def __init__(self, content: str) -> None:
+        self._content = content
+        self.calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=self._content))],
+            usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7),
+        )
+
+
+class _FakeOpenAIClient:
+    """The Chat Completions stand-in, for every non-Anthropic provider."""
+
+    def __init__(self, content: str) -> None:
+        self.chat = SimpleNamespace(completions=_FakeCompletionsAPI(content))
+
+
 class _FakeAnthropicClient:
     """Stand-in for the SDK client, which speaks httpx2 and so escapes respx."""
 
@@ -131,7 +151,8 @@ async def test_configured_synthesis_model_is_what_reaches_call_llm(
     assert call["model"] == "ollama:gemma4:31b"
     assert call["system_prompt"] == ask_module.SYSTEM_PROMPT
     assert call["max_tokens"] == settings.synthesis_max_tokens
-    assert call["output_schema"] is None
+    # /ask answers in prose, so it relies on the default instead of passing None.
+    assert "output_schema" not in call
 
 
 async def test_synthesis_cost_is_persisted(call_log: list[dict[str, Any]]) -> None:
@@ -219,8 +240,38 @@ async def test_llm_failure_degrades_to_an_error_string(
     assert "LLM synthesis failed" in caplog.text
 
 
-def test_no_private_anthropic_client_survives() -> None:
-    """Dedup guard: the transport lives in kb.agents.providers only."""
-    assert not hasattr(ask_module, "get_anthropic_client")
-    assert not hasattr(ask_module, "_anthropic_client")
-    assert "anthropic" not in vars(ask_module)
+async def test_ask_answers_on_a_provider_with_no_anthropic_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behaviour, not module shape: /ask must run on a non-Anthropic provider alone.
+
+    With ANTHROPIC_API_KEY unset and SYNTHESIS_MODEL=ollama:gemma4:31b, the real
+    call_llm resolves the Chat Completions transport. A private Anthropic client
+    left behind in kb.functions.ask would fail here instead of answering.
+    """
+    _patch_ask_io(monkeypatch)
+    monkeypatch.setattr(settings, "synthesis_model", "ollama:gemma4:31b")
+    monkeypatch.setattr(
+        providers,
+        "settings",
+        Settings.model_validate(
+            {
+                "ollama_api_key": "ollama-test",
+                "anthropic_api_key": "",
+                "default_provider": "ollama",
+            }
+        ),
+    )
+    client = _FakeOpenAIClient(ANSWER_JSON_SAFE)
+    monkeypatch.setattr(providers, "get_openai_client", lambda provider: client)
+
+    async def fake_record_llm_cost(**kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(providers, "record_llm_cost", fake_record_llm_cost)
+
+    result = await ask_module.ask_question(_FakeSession(), QUESTION)  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+
+    assert result["answer"] == ANSWER_JSON_SAFE
+    assert client.chat.completions.calls[-1]["model"] == "gemma4:31b"
