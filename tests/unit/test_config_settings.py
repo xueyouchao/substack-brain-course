@@ -6,6 +6,8 @@ public pydantic interface, so renaming an internal helper never breaks these.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -32,16 +34,26 @@ STRUCTURED_OUTPUT_FIELDS = ("ollama_structured_output", "opencode_structured_out
 PRICING_MODE_FIELDS = ("ollama_pricing_mode", "opencode_pricing_mode")
 
 
+@pytest.fixture(autouse=True)
+def _clean_provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop ambient provider variables so an exported value cannot skew a case."""
+    for name in (*PROVIDER_SURFACE_DEFAULTS, "digest_cron", "inngest_dev"):
+        monkeypatch.delenv(name.upper(), raising=False)
+
+
+def _from_env() -> Settings:
+    """Build from the environment only, ignoring any local .env file."""
+    return Settings(_env_file=None)  # type: ignore[call-arg]
+
+
 @pytest.mark.parametrize(("name", "expected"), PROVIDER_SURFACE_DEFAULTS.items())
 def test_provider_surface_default_matches_contract(name: str, expected: str) -> None:
-    # model_validate({}) consults field defaults only, so an ambient .env or
-    # exported variable can never make this pass for the wrong reason.
-    assert getattr(Settings.model_validate({}), name) == expected
+    assert getattr(_from_env(), name) == expected
 
 
 def test_existing_model_defaults_are_unchanged() -> None:
     """Zero-behaviour-change guard: T1 only adds fields, it never retunes them."""
-    settings = Settings.model_validate({})
+    settings = _from_env()
 
     assert settings.synthesis_model == "claude-haiku-5-5"
     assert settings.extraction_model == "claude-haiku-5-5"
@@ -58,13 +70,75 @@ def test_env_overrides_provider_surface(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("OLLAMA_STRUCTURED_OUTPUT", "native")
     monkeypatch.setenv("OPENCODE_PRICING_MODE", "per_token")
 
-    settings = Settings()
+    settings = _from_env()
 
     assert settings.default_provider == "ollama"
     assert settings.ollama_base_url == "http://localhost:11434/v1"
     assert settings.ollama_api_key == "ollama"
     assert settings.ollama_structured_output == "native"
     assert settings.opencode_pricing_mode == "per_token"
+
+
+@pytest.mark.parametrize(("name", "expected"), PROVIDER_SURFACE_DEFAULTS.items())
+def test_blank_env_value_falls_back_to_the_default(
+    name: str, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`cp .env.example .env` leaves blank assignments; blank means "not set"."""
+    monkeypatch.setenv(name.upper(), "")
+
+    assert getattr(_from_env(), name) == expected
+
+
+def test_blank_literal_tier_does_not_break_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENCODE_PRICING_MODE", "")
+    monkeypatch.setenv("OLLAMA_STRUCTURED_OUTPUT", "")
+
+    settings = _from_env()
+
+    assert settings.opencode_pricing_mode == "subscription"
+    assert settings.ollama_structured_output == "json_mode"
+
+
+def test_blank_values_in_a_dotenv_file_are_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real failure path: README tells users to copy .env.example verbatim."""
+    (tmp_path / ".env").write_text(
+        "OLLAMA_BASE_URL=\nOPENCODE_PRICING_MODE=\nOLLAMA_API_KEY=\nANTHROPIC_BASE_URL=\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    settings = Settings()
+
+    assert settings.ollama_base_url == "https://ollama.com/v1"
+    assert settings.opencode_pricing_mode == "subscription"
+    assert settings.ollama_api_key == ""
+    assert settings.anthropic_base_url == ""
+
+
+def test_fields_defaulting_to_blank_still_read_blank(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MEMGRAPH_USER", "")
+    monkeypatch.setenv("INNGEST_EVENT_KEY", "")
+
+    settings = _from_env()
+
+    assert settings.memgraph_user == ""
+    assert settings.inngest_event_key == ""
+
+
+def test_blank_value_does_not_disable_the_existing_validators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DIGEST_CRON", ' "0 8 * * 1" ')
+    monkeypatch.setenv("INNGEST_DEV", "false")
+    monkeypatch.setenv("INNGEST_BASE_URL", "")
+
+    settings = _from_env()
+
+    assert settings.digest_cron == "0 8 * * 1"
+    assert settings.inngest_dev is False
+    assert settings.inngest_base_url == "https://api.inngest.com"
 
 
 @pytest.mark.parametrize("field", STRUCTURED_OUTPUT_FIELDS)
@@ -85,7 +159,7 @@ def test_invalid_structured_output_from_env_is_rejected_at_startup(
     monkeypatch.setenv("OLLAMA_STRUCTURED_OUTPUT", "garbage")
 
     with pytest.raises(ValidationError):
-        Settings()
+        _from_env()
 
 
 @pytest.mark.parametrize("tier", ["native", "json_mode", "prompt_only"])
