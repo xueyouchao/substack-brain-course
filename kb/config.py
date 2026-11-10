@@ -112,6 +112,12 @@ class Settings(BaseSettings):
     # aim the anthropic_messages transport at any compatible gateway.
     anthropic_base_url: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
+    # Any OpenAI-compatible gateway is reachable as "openai:<model>" plus this
+    # base_url, so the row needs the same two downgrade knobs as Ollama/OpenCode:
+    # a proxy that ignores response_format, or bills a flat rate, must be an env
+    # change and not a code change. Defaults match docs §4 (native / per_token).
+    openai_structured_output: Literal["native", "json_mode", "prompt_only"] = "native"
+    openai_pricing_mode: Literal["per_token", "subscription", "unknown"] = "per_token"
     # Ollama Cloud serves both API families from one key, so the two families
     # need separate hosts instead of sharing a single base_url.
     # For a local Ollama, point ollama_base_url at http://localhost:11434/v1

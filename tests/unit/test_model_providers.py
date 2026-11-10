@@ -9,9 +9,13 @@ respx, so the suite needs neither the network nor a real API key.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
+import anthropic
+import httpx2
+import openai
 import pytest
 from pydantic import BaseModel
 
@@ -273,7 +277,9 @@ def test_ollama_structured_output_env_override_reaches_the_transport(
 ) -> None:
     _settings(monkeypatch, ollama_structured_output="native")
 
-    assert providers._structured_output_mode("ollama", providers.PROVIDERS["ollama"]) == "native"
+    resolved = providers.resolve_model("ollama:gemma4:31b")
+
+    assert providers._structured_output_mode(resolved) == "native"
 
 
 def test_client_endpoints_come_from_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -473,3 +479,195 @@ async def test_missing_transform_schema_downgrades_instead_of_failing(
     assert "output_config" not in sent
     assert "JSON Schema" in sent["system"]
     assert result["output"] == {"verdict": "yes", "confidence": 3}
+
+def _fake_anthropic_blocks(monkeypatch: pytest.MonkeyPatch, blocks: list[Any]) -> None:
+    """Anthropic-family fake whose content blocks the test chooses verbatim."""
+    client = SimpleNamespace(
+        messages=_FakeMessagesAPI(
+            SimpleNamespace(
+                content=blocks,
+                usage=SimpleNamespace(input_tokens=11, output_tokens=7),
+            )
+        )
+    )
+    monkeypatch.setattr(providers, "get_anthropic_client", lambda provider="anthropic": client)
+
+
+class _RefusingAPI:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def create(self, **kwargs: Any) -> Any:
+        raise self._exc
+
+
+class _RefusingClient:
+    """Refuses both API families with one exception, so the guard is family-agnostic."""
+
+    def __init__(self, exc: Exception) -> None:
+        self.messages = _RefusingAPI(exc)
+        self.chat = SimpleNamespace(completions=_RefusingAPI(exc))
+
+
+def _status_error(exc_type: Callable[..., Exception], status: int) -> Exception:
+    """A real SDK 401/403, which is what the guard has to recognise."""
+    request = httpx2.Request("POST", "https://opencode.ai/inference/openai/v1/chat/completions")
+    return exc_type("refused", response=httpx2.Response(status, request=request), body=None)
+
+
+def _fake_refusing(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+    client = _RefusingClient(exc)
+    monkeypatch.setattr(providers, "get_anthropic_client", lambda provider="anthropic": client)
+    monkeypatch.setattr(providers, "get_openai_client", lambda provider: client)
+
+
+@pytest.mark.parametrize(
+    ("ref", "exc_type", "status"),
+    [
+        ("opencode:glm-5.3", openai.AuthenticationError, 401),
+        ("opencode-anthropic:claude-haiku-5-5", anthropic.PermissionDeniedError, 403),
+    ],
+)
+async def test_opencode_auth_failure_explains_the_free_tier(
+    monkeypatch: pytest.MonkeyPatch, ref: str, exc_type: Callable[..., Exception], status: int
+) -> None:
+    """The free tier only answers 401/403, so the message has to name the real fix."""
+    _settings(monkeypatch)
+    original = _status_error(exc_type, status)
+    _fake_refusing(monkeypatch, original)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await providers.call_llm(system_prompt="sys", user_input="hi", model=ref)
+
+    message = str(excinfo.value)
+    provider, _, model_id = ref.partition(":")
+    assert provider in message
+    assert model_id in message
+    assert "免费档模型只允许在 OpenCode 内部使用，请改用 Go 订阅或付费模型。" in message
+    # The original SDK error stays reachable: the cause is the evidence.
+    assert excinfo.value.__cause__ is original
+
+
+async def test_auth_failure_on_another_provider_keeps_its_own_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hint is OpenCode-specific: wrapping every provider would hide real errors."""
+    _settings(monkeypatch)
+    original = _status_error(anthropic.AuthenticationError, 401)
+    _fake_refusing(monkeypatch, original)
+
+    with pytest.raises(anthropic.AuthenticationError) as excinfo:
+        await providers.call_llm(
+            system_prompt="sys", user_input="hi", model="anthropic:claude-haiku-5-5"
+        )
+
+    assert excinfo.value is original
+
+
+async def test_tool_use_input_json_text_is_parsed_before_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway may hand the object back as JSON text inside tool_use.input."""
+    _settings(monkeypatch)
+    _fake_anthropic_blocks(monkeypatch, [SimpleNamespace(type="tool_use", input=VERDICT_JSON)])
+
+    result = await providers.call_llm(
+        system_prompt="sys", user_input="hi", model="claude-haiku-5-5", output_schema=Verdict
+    )
+
+    assert result["output"] == {"verdict": "yes", "confidence": 3}
+
+
+async def test_tool_use_input_object_is_validated_directly(monkeypatch: pytest.MonkeyPatch) -> None:
+    _settings(monkeypatch)
+    _fake_anthropic_blocks(
+        monkeypatch, [SimpleNamespace(type="tool_use", input={"verdict": "yes", "confidence": 3})]
+    )
+
+    result = await providers.call_llm(
+        system_prompt="sys", user_input="hi", model="claude-haiku-5-5", output_schema=Verdict
+    )
+
+    assert result["output"] == {"verdict": "yes", "confidence": 3}
+
+
+async def test_double_encoded_json_text_still_reaches_the_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """docs §6: the chain holds for every tier, however many text layers a gateway adds."""
+    _settings(monkeypatch)
+    _fake_openai(monkeypatch, json.dumps(VERDICT_JSON))
+
+    result = await providers.call_llm(
+        system_prompt="sys", user_input="hi", model="opencode:glm-5.3", output_schema=Verdict
+    )
+
+    assert result["output"] == {"verdict": "yes", "confidence": 3}
+
+
+def test_every_setting_named_in_the_table_exists_on_settings() -> None:
+    """mypy cannot see through getattr, so a typo would only fail on a live request."""
+    for provider, spec in providers.PROVIDERS.items():
+        for field in (
+            spec.base_url_setting,
+            spec.key_setting,
+            spec.structured_setting,
+            spec.pricing_setting,
+        ):
+            if field:
+                assert field in Settings.model_fields, f"{provider}: unknown setting {field!r}"
+
+
+@pytest.mark.parametrize("provider", sorted(providers.PROVIDERS))
+def test_settings_default_matches_the_table_endpoint(
+    provider: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row's canonical endpoint and its Settings default are one fact, not two.
+
+    `_env_file=None` plus a cleared environment keeps a developer's own .env out of
+    the comparison, which is what makes a failure here reproducible.
+    """
+    spec = providers.PROVIDERS[provider]
+    if spec.default_base_url is None:
+        pytest.skip("this row lets the SDK choose its endpoint")
+    for field in (
+        spec.base_url_setting,
+        spec.key_setting,
+        spec.structured_setting,
+        spec.pricing_setting,
+    ):
+        if field:
+            monkeypatch.delenv(field.upper(), raising=False)
+
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+
+    assert getattr(settings, spec.base_url_setting) == spec.default_base_url
+
+
+async def test_openai_structured_output_env_override_downgrades_the_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """docs §3 promises any gateway as "openai:<model>", so this row needs the knob."""
+    _settings(monkeypatch, openai_structured_output="prompt_only")
+    client = _fake_openai(monkeypatch, VERDICT_JSON)
+
+    await providers.call_llm(
+        system_prompt="sys", user_input="hi", model="openai:gpt-4o-mini", output_schema=Verdict
+    )
+
+    sent = client.chat.completions.calls[-1]
+    assert "response_format" not in sent
+    assert "JSON Schema" in sent["messages"][0]["content"]
+
+
+async def test_openai_pricing_mode_env_override_reaches_the_cost_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _settings(monkeypatch, openai_pricing_mode="subscription")
+    _fake_openai(monkeypatch, "plain answer")
+
+    result = await providers.call_llm(system_prompt="sys", user_input="hi", model="openai:gpt-4o")
+
+    assert result["usage"]["pricing_mode"] == "subscription"
+    assert result["usage"]["est_usd"] == 0.0
+

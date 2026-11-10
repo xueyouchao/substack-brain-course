@@ -90,7 +90,6 @@ async def _synthesize(question: str, passages: list[dict[str, Any]]) -> str:
             user_input=prompt,
             model=settings.synthesis_model,
             max_tokens=settings.synthesis_max_tokens,
-            output_schema=None,
             persist_cost=True,
         )
     except Exception as exc:

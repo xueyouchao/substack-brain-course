@@ -38,6 +38,19 @@ logger = logging.getLogger(__name__)
 # loop the same config gap would otherwise fill the log with identical lines.
 _warned_unknown_pricing: set[tuple[str, str]] = set()
 
+# A refused key (401/403), one class per SDK family. Catching these by name is what
+# keeps the OpenCode hint below from swallowing unrelated failures.
+_AUTH_ERRORS = (
+    anthropic.AuthenticationError,
+    anthropic.PermissionDeniedError,
+    openai.AuthenticationError,
+    openai.PermissionDeniedError,
+)
+
+# OpenCode's free tier is licensed for use inside the OpenCode apps only, so the
+# same key and model id answer 401/403 when called from a pipeline.
+_OPENCODE_FREE_TIER_HINT = "免费档模型只允许在 OpenCode 内部使用，请改用 Go 订阅或付费模型。"
+
 
 @dataclass(frozen=True)
 class ProviderSpec:
@@ -45,8 +58,8 @@ class ProviderSpec:
 
     `base_url_setting` / `structured_setting` / `pricing_setting` name `Settings`
     attributes, so adding a provider is one table row plus env, never a branch in
-    the call path. A `None` setting means the provider has no env knob of its own
-    and uses the built-in tier from docs §4.
+    the call path. A `None` setting means the provider has no env knob of its own,
+    and the row's `default_*` value from docs §4 applies instead.
     """
 
     api_family: str  # "anthropic_messages" | "openai_chat"
@@ -54,6 +67,10 @@ class ProviderSpec:
     key_setting: str  # empty string means "this provider needs no key"
     structured_setting: str | None
     pricing_setting: str | None
+    # docs §4 tiers for this row, and the fallback whenever the setting above is
+    # None: a new provider fills these in and never touches a lookup helper.
+    default_structured: str  # "native" | "json_mode" | "prompt_only"
+    default_pricing: str  # "per_token" | "subscription" | "unknown"
     # Canonical endpoint used when the env value is empty. An empty OLLAMA_BASE_URL
     # must mean "unset", not "call the empty host": `cp .env.example .env` ships
     # every base_url blank and pydantic keeps that "" instead of the default.
@@ -70,14 +87,18 @@ PROVIDERS: dict[str, ProviderSpec] = {
         key_setting="anthropic_api_key",
         structured_setting=None,
         pricing_setting=None,
+        default_structured="native",
+        default_pricing="per_token",
         default_base_url=None,  # None = let the Anthropic SDK pick its endpoint
     ),
     "openai": ProviderSpec(
         api_family="openai_chat",
         base_url_setting="openai_base_url",
         key_setting="openai_api_key",
-        structured_setting=None,
-        pricing_setting=None,
+        structured_setting="openai_structured_output",
+        pricing_setting="openai_pricing_mode",
+        default_structured="native",
+        default_pricing="per_token",
         default_base_url="https://api.openai.com/v1",
     ),
     "ollama": ProviderSpec(
@@ -86,6 +107,8 @@ PROVIDERS: dict[str, ProviderSpec] = {
         key_setting="ollama_api_key",
         structured_setting="ollama_structured_output",
         pricing_setting="ollama_pricing_mode",
+        default_structured="json_mode",
+        default_pricing="unknown",
         default_base_url="https://ollama.com/v1",
     ),
     "ollama-anthropic": ProviderSpec(
@@ -94,6 +117,8 @@ PROVIDERS: dict[str, ProviderSpec] = {
         key_setting="ollama_api_key",
         structured_setting=None,
         pricing_setting=None,
+        default_structured="prompt_only",
+        default_pricing="unknown",
         default_base_url="https://ollama.com",
     ),
     "opencode": ProviderSpec(
@@ -102,6 +127,8 @@ PROVIDERS: dict[str, ProviderSpec] = {
         key_setting="opencode_api_key",
         structured_setting="opencode_structured_output",
         pricing_setting="opencode_pricing_mode",
+        default_structured="prompt_only",
+        default_pricing="subscription",
         default_base_url="https://opencode.ai/inference/openai/v1",
     ),
     "opencode-anthropic": ProviderSpec(
@@ -110,16 +137,10 @@ PROVIDERS: dict[str, ProviderSpec] = {
         key_setting="opencode_api_key",
         structured_setting="opencode_structured_output",
         pricing_setting="opencode_pricing_mode",
+        default_structured="prompt_only",
+        default_pricing="subscription",
         default_base_url="https://opencode.ai/inference/anthropic",
     ),
-}
-
-# docs §4 tiers for the entries that carry no env knob of their own. Keyed by
-# provider so a new None-setting row fails loudly here instead of guessing.
-_BUILTIN_TIERS: dict[str, tuple[str, str]] = {
-    "anthropic": ("native", "per_token"),
-    "openai": ("native", "per_token"),
-    "ollama-anthropic": ("prompt_only", "unknown"),
 }
 
 # Provider names users reach for that this layer deliberately does not serve. A
@@ -216,16 +237,19 @@ def _api_key(provider: str, spec: ProviderSpec) -> str:
     return key
 
 
-def _structured_output_mode(provider: str, spec: ProviderSpec) -> str:
-    if spec.structured_setting is not None:
-        return str(getattr(settings, spec.structured_setting))
-    return _BUILTIN_TIERS[provider][0]
+def _setting_or_default(setting_name: str | None, default: str) -> str:
+    """One lookup for both tiers: the env knob when the row has one, else its default."""
+    return str(getattr(settings, setting_name)) if setting_name is not None else default
 
 
-def _pricing_mode(provider: str, spec: ProviderSpec) -> str:
-    if spec.pricing_setting is not None:
-        return str(getattr(settings, spec.pricing_setting))
-    return _BUILTIN_TIERS[provider][1]
+def _structured_output_mode(resolved: ResolvedModel) -> str:
+    spec = resolved.spec
+    return _setting_or_default(spec.structured_setting, spec.default_structured)
+
+
+def _pricing_mode(resolved: ResolvedModel) -> str:
+    spec = resolved.spec
+    return _setting_or_default(spec.pricing_setting, spec.default_pricing)
 
 
 def get_anthropic_client(provider: str) -> anthropic.AsyncAnthropic:
@@ -258,24 +282,23 @@ def get_openai_client(provider: str) -> openai.AsyncOpenAI:
     return client
 
 
-def _warn_unknown_pricing_once(provider: str, model_id: str) -> None:
+def _warn_unknown_pricing_once(resolved: ResolvedModel) -> None:
     """Say once that a model's spend is untracked, so a reviewer sees it in the log."""
-    key = (provider, model_id)
+    key = (resolved.provider, resolved.model_id)
     if key in _warned_unknown_pricing:
         return
     _warned_unknown_pricing.add(key)
     logger.warning(
         "pricing_mode=unknown for provider=%r model=%r: est_usd is reported as 0.0, so USD "
         "budgets cannot bind. Set the provider's pricing mode to per_token to track spend.",
-        provider,
-        model_id,
+        resolved.provider,
+        resolved.model_id,
     )
 
 
 def estimate_llm_cost_usd(
     *,
-    provider: str,
-    model_id: str,
+    resolved: ResolvedModel,
     pricing_mode: str,
     input_tokens: int,
     output_tokens: int,
@@ -283,10 +306,10 @@ def estimate_llm_cost_usd(
     """Estimate USD for one call. Flat-rate plans report 0.0 (docs §7)."""
     if pricing_mode != "per_token":
         if pricing_mode == "unknown":
-            _warn_unknown_pricing_once(provider, model_id)
+            _warn_unknown_pricing_once(resolved)
         return 0.0
     in_price, out_price = MODEL_PRICING_PER_MTOK.get(
-        model_id,
+        resolved.model_id,
         (
             settings.anthropic_input_price_per_million_tokens,
             settings.anthropic_output_price_per_million_tokens,
@@ -326,16 +349,13 @@ def _extract_json_object(raw_text: str) -> str:
     return stripped
 
 
-def _schema_instruction(schema: type[BaseModel]) -> str:
-    """Prompt-side schema contract for the tiers without native enforcement."""
+def _schema_instruction(system_prompt: str, schema: type[BaseModel]) -> str:
+    """Append the prompt-side schema contract used by the non-native tiers."""
     return (
+        f"{system_prompt}\n\n"
         "只输出符合以下 JSON Schema 的单个 JSON 对象，不要包含解释或 markdown 围栏：\n"
         f"{json.dumps(schema.model_json_schema(), ensure_ascii=False)}"
     )
-
-
-def _with_schema_instruction(system_prompt: str, schema: type[BaseModel]) -> str:
-    return f"{system_prompt}\n\n{_schema_instruction(schema)}"
 
 
 def _anthropic_json_schema(
@@ -379,7 +399,7 @@ async def _call_anthropic_messages(
     output_schema: type[BaseModel] | None,
 ) -> tuple[Any, int, int]:
     client = get_anthropic_client(resolved.provider)
-    mode = _structured_output_mode(resolved.provider, resolved.spec)
+    mode = _structured_output_mode(resolved)
     kwargs: dict[str, Any] = {
         "model": resolved.model_id,
         "max_tokens": max_tokens,
@@ -397,7 +417,7 @@ async def _call_anthropic_messages(
         if schema is not None:
             kwargs["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
         else:
-            kwargs["system"] = _with_schema_instruction(system_prompt, output_schema)
+            kwargs["system"] = _schema_instruction(system_prompt, output_schema)
 
     response = await client.messages.create(**kwargs)
     usage_obj = getattr(response, "usage", None)
@@ -415,7 +435,7 @@ async def _call_openai_chat(
     output_schema: type[BaseModel] | None,
 ) -> tuple[Any, int, int]:
     client = get_openai_client(resolved.provider)
-    mode = _structured_output_mode(resolved.provider, resolved.spec)
+    mode = _structured_output_mode(resolved)
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_input},
@@ -443,7 +463,7 @@ async def _call_openai_chat(
             kwargs["messages"] = [
                 {
                     "role": "system",
-                    "content": _with_schema_instruction(system_prompt, output_schema),
+                    "content": _schema_instruction(system_prompt, output_schema),
                 },
                 {"role": "user", "content": user_input},
             ]
@@ -456,12 +476,28 @@ async def _call_openai_chat(
     return content, input_tokens, output_tokens
 
 
+# docs §6: the error message quotes the head of the offending output, and truncating
+# there is what keeps one bad response from flooding the log. Named rather than
+# inline because kb/config.py's rule is "Never a magic number inline".
+_ERROR_SNIPPET_CHARS = 200
+
+
+def _parse_json_payload(raw: Any) -> Any:
+    """Reach the object behind JSON text, however many layers a gateway added.
+
+    The chain of docs §6 holds for all three tiers, so text is unwrapped before it
+    is validated: a Chat Completions body arrives as a str, and a gateway that
+    re-encodes the structure wraps the same object one layer deeper. Unwrapping
+    terminates because a JSON string literal is always longer than its payload.
+    """
+    data = raw
+    while isinstance(data, str):
+        data = json.loads(_extract_json_object(data))
+    return data
+
+
 def _validate_structured_output(
-    raw: Any,
-    schema: type[BaseModel],
-    *,
-    provider: str,
-    model_id: str,
+    raw: Any, schema: type[BaseModel], *, resolved: ResolvedModel
 ) -> BaseModel:
     """Fallback chain for every tier: strip fences, parse JSON, validate.
 
@@ -469,13 +505,13 @@ def _validate_structured_output(
     with the provider, the model and the head of the offending text.
     """
     try:
-        data = json.loads(_extract_json_object(raw)) if isinstance(raw, str) else raw
-        return schema.model_validate(data)
+        return schema.model_validate(_parse_json_payload(raw))
     except ValueError as exc:  # json.JSONDecodeError and pydantic.ValidationError
         snippet = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, default=str)
         raise RuntimeError(
-            f"provider={provider!r} model={model_id!r} did not return valid {schema.__name__} "
-            f"JSON ({exc}); raw output starts with: {snippet[:200]!r}"
+            f"provider={resolved.provider!r} model={resolved.model_id!r} did not return valid "
+            f"{schema.__name__} JSON ({exc}); raw output starts with: "
+            f"{snippet[:_ERROR_SNIPPET_CHARS]!r}"
         ) from exc
 
 
@@ -496,23 +532,31 @@ async def call_llm(
     routing to `DEFAULT_PROVIDER`, so existing call sites need no change.
     """
     resolved = resolve_model(model)
-    pricing_mode = _pricing_mode(resolved.provider, resolved.spec)
+    pricing_mode = _pricing_mode(resolved)
     transport = (
         _call_anthropic_messages
         if resolved.spec.api_family == "anthropic_messages"
         else _call_openai_chat
     )
-    raw_output, input_tokens, output_tokens = await transport(
-        resolved,
-        system_prompt=system_prompt,
-        user_input=user_input,
-        max_tokens=max_tokens,
-        output_schema=output_schema,
-    )
+    try:
+        raw_output, input_tokens, output_tokens = await transport(
+            resolved,
+            system_prompt=system_prompt,
+            user_input=user_input,
+            max_tokens=max_tokens,
+            output_schema=output_schema,
+        )
+    except _AUTH_ERRORS as exc:
+        # Only the transport is wrapped: every other failure keeps its own type.
+        if not resolved.provider.startswith("opencode"):
+            raise
+        raise RuntimeError(
+            f"provider={resolved.provider!r} model={resolved.model_id!r} rejected the "
+            f"credentials (401/403: {exc}). {_OPENCODE_FREE_TIER_HINT}"
+        ) from exc
 
     est_usd = estimate_llm_cost_usd(
-        provider=resolved.provider,
-        model_id=resolved.model_id,
+        resolved=resolved,
         pricing_mode=pricing_mode,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -538,9 +582,7 @@ async def call_llm(
         )
 
     if output_schema is not None:
-        validated = _validate_structured_output(
-            raw_output, output_schema, provider=resolved.provider, model_id=resolved.model_id
-        )
+        validated = _validate_structured_output(raw_output, output_schema, resolved=resolved)
         return {"output": validated.model_dump(mode="json"), "usage": usage}
 
     return {"output": str(raw_output or ""), "usage": usage}
