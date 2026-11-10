@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _is_blank(value: object) -> bool:
+    return isinstance(value, str) and not value.strip()
 
 
 class Settings(BaseSettings):
@@ -127,6 +131,18 @@ class Settings(BaseSettings):
     opencode_api_key: str = ""
     opencode_structured_output: Literal["native", "json_mode", "prompt_only"] = "prompt_only"
     opencode_pricing_mode: Literal["per_token", "subscription", "unknown"] = "subscription"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _treat_blank_as_unset(cls, data: Any) -> Any:
+        # `cp .env.example .env` leaves lines like `OLLAMA_BASE_URL=` behind, and a
+        # blank assignment is nobody's intent: keep it, and it silently wipes a
+        # non-empty default (or, for a Literal field, refuses to start at all
+        # because "" is not a valid tier). Dropping the key here lets the field
+        # default apply, in one place, for env vars and .env files alike.
+        if not isinstance(data, dict):
+            return data
+        return {key: value for key, value in data.items() if not _is_blank(value)}
 
     @field_validator("digest_cron", mode="before")
     @classmethod
