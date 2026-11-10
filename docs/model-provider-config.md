@@ -1,6 +1,6 @@
 # 模型层开放化改造 · 设计稿（Spec）
 
-> 状态：**已确认，实施中**。本文只描述设计，未改任何代码。
+> 状态：**已实施完成**（分支 `spec/model-provider-config`，四张工单全部合入）。本文保留为设计与决策依据；使用说明见 `.env.example` 的 `# --- Model providers ---` 段与 `README.md` 的 `### Picking a model backend`。
 > 决策来源：与你的访谈结论（见文末「已敲定决策」）。
 
 ## 1. 目标 / 非目标
@@ -23,7 +23,7 @@
         ▼
 kb/agents/providers.py
   ├─ resolve_model(ref) -> ResolvedModel(provider, model_id, spec)     ← 新增
-  ├─ build_structured_output(...) 三档策略                              ← 新增
+  ├─ _structured_output_mode() 选档；三档分支落在各自 transport 里       ← 新增
   ├─ transport: AnthropicMessages / OpenAIChatCompletions             ← 新增
   └─ estimate_llm_cost_usd(provider, model_id, in, out, mode)          ← 改签名(内部)
         ▲
@@ -62,7 +62,7 @@ kb/config.py  Settings: 新增 default_provider + 各 provider 的 base_url/key/
 | `opencode` | openai_chat | `https://opencode.ai/inference/openai/v1` | `OPENCODE_API_KEY` | `prompt_only` | `subscription` |
 | `opencode-anthropic` | anthropic_messages | `https://opencode.ai/inference/anthropic` | `OPENCODE_API_KEY` | `prompt_only` | `subscription` |
 
-每条含字段：`api_family` / `base_url` / `key_env` / `structured` / `pricing` / `notes`。
+每条的字段：`api_family` / `base_url_setting` / `key_setting` / `structured_setting` / `pricing_setting` / `default_base_url` / `default_structured` / `default_pricing`。`*_setting` 存的是 `Settings` 属性名；为 `None` 表示该 provider 没有自己的 env 开关，改用 `default_*` 字段。
 
 **为什么同一网关占两个条目**：OpenCode Console 与 Ollama 都同时暴露两种 API 族（`/inference/openai/v1` 与 `/inference/anthropic`、`ollama.com/v1` 与 `ollama.com`），而 OpenCode **按模型**分配族——Claude 系走 Anthropic Messages，GLM / Kimi / DeepSeek / Qwen 走 Chat Completions。把 `provider → api_family` 定成 1:1 就表达不了这种「同 key 不同族」。拆成两个条目后，选族这件事退化成选 provider 名，不需要维护模型→族映射表，也不需要运行时探测：
 
@@ -71,7 +71,7 @@ OPENCODE 模型（Chat Completions 族）：模型名 => opencode:glm-5.3
 OPENCODE 模型（Anthropic Messages 族）：模型名 => opencode-anthropic:claude-haiku-5-5
 ```
 
-两个条目共用 `OPENCODE_API_KEY`，所以用户只需一个 key。属性覆盖项也共用：`OPENCODE_*` 同时作用于两个条目（配套实现：能力表条目带 `alias_of` 字段指向 env 前缀）。
+两个条目共用 `OPENCODE_API_KEY`，所以用户只需一个 key；`OPENCODE_STRUCTURED_OUTPUT` / `OPENCODE_PRICING_MODE` 也同时作用于两个条目（实现上就是两行的 `*_setting` 指向同一批 env 开关，不需要额外的别名机制）。
 
 **本地 Ollama**：无需新 provider，覆盖 base_url 即可
 `OLLAMA_BASE_URL=http://localhost:11434/v1`，key 任意值（Ollama 忽略）。
@@ -150,10 +150,12 @@ schema 注入文本统一由 `_schema_instruction(schema) -> str` 生成，附�
 |---|---|
 | `kb/config.py` | 加 `default_provider` 与 4 组 provider 覆盖项；5 个 `*_MODEL` 默认值不变 |
 | `kb/agents/providers.py` | 加能力表 `PROVIDERS`、`resolve_model()`、`_schema_instruction()`、两个 adapter、`pricing_mode` 支持；`estimate_llm_cost_usd` 内部改签名；`_anthropic_client` 单例按 `(provider, base_url)` 分键 |
-| `kb/functions/ask.py` | **删除** 私有 `_anthropic_client` / `get_anthropic_client` / `_synthesize` 里的直连调用，改走 `call_llm`；保留「失败返回错误字符串而非抛异常」的现有语义 |
+| `kb/functions/ask.py` | **删除** 私有 `_anthropic_client` / `get_anthropic_client` / `_synthesize` 里的直连调用，改走 `call_llm`；保留「失败返回错误字符串而非抛异常」的现有语义。**并补上 `persist_cost=True`**：`/ask` 不经 Inngest step（`kb/main.py` 直接 `await`），`CostCaptureMiddleware` 在 `result.step is None` 时直接 return，所以往响应里塞 `usage` 永远不会被记录，只有直写 costs 表这条路有效 |
 | `.env.example` | 加 `DEFAULT_PROVIDER` 与 provider 覆盖项样例 + 订阅档预算失效的注释 |
 | `docs/model-provider-config.md` | 本文件，确认后转正为使用说明 |
 | `tests/unit/test_model_providers.py` | 新增（见 §9） |
+| `tests/unit/test_config_settings.py` | 新增：配置面默认值、env 覆盖、`Literal` 拒绝非法档位、空值回退 |
+| `tests/unit/test_ask_provider.py` | 新增：`SYNTHESIS_MODEL` 透传、`persist_cost`、成本落库、`/ask` 响应契约 |
 | `README.md` | 配置章节补一段指向本文 |
 
 **不改**：`kb/sources/embedder.py`、`kb/inngest_client.py`、17 处 `call_llm` 调用点、`kb/agents/core.py`、任何 alembic 迁移。
@@ -198,7 +200,7 @@ schema 注入文本统一由 `_schema_instruction(schema) -> str` 生成，附�
 
 1. `config.py` 加配置项（无行为变更，现有测试应全绿）
 2. `providers.py` 加能力表 + `resolve_model` + 两个 adapter + 三档结构化输出
-3. 新增 `tests/unit/test_model_providers.py`（先红后绿）
+3. 新增 `tests/unit/test_model_providers.py`（先红后绿）；`test_config_settings.py` 随第 1 步、`test_ask_provider.py` 随第 4 步
 4. `ask.py` 收敛去重
 5. `.env.example` / `README.md` / `docs/` 收尾
 6. `uv run pytest` + `ruff check` + `mypy kb scripts tests` 全绿
