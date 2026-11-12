@@ -119,6 +119,19 @@ cd substack-brain-course
 cp .env.example .env        # fill in OPENAI_API_KEY (ANTHROPIC_API_KEY is optional)
 ```
 
+### Picking a model backend
+
+Every `*_MODEL` setting takes an optional `provider:model` prefix, so the same
+pipeline can talk to Anthropic, OpenAI, Ollama Cloud (or a local Ollama) or
+OpenCode Go without a code change — `ollama:gemma4:31b` and
+`opencode:glm-5.3` are just setting values. A name with no prefix uses
+`DEFAULT_PROVIDER`, which defaults to `anthropic`, so an existing `.env`
+keeps working untouched. `.env.example` carries copy-paste blocks for the three
+common setups, plus the warning that flat-rate providers always report
+`est_usd = 0` (so `RESEARCH_MAX_USD` does not bind there — `RESEARCH_MAX_ITERATIONS`
+is the real cap). The capability table, structured-output tiers and cost modes
+are in [docs/model-provider-config.md](docs/model-provider-config.md).
+
 Each week builds on the previous one, so follow them in order!
 
 ---

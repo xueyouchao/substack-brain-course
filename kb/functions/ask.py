@@ -2,9 +2,10 @@
 
 This is a fast read, so it never creates an Inngest run. A workflow engine is
 for expensive work you'd hate to lose; here someone is waiting, and retrying
-in three minutes is useless. So `ask_question` talks to Postgres and Claude
-directly, saves a snapshot of everything it did, and only then sends a
-fire-and-forget `kb/answer.produced` event for the evaluators of week 5.
+in three minutes is useless. So `ask_question` talks to Postgres and the
+configured LLM provider directly, saves a snapshot of everything it did, and only
+then sends a fire-and-forget `kb/answer.produced` event for the evaluators of
+week 5.
 """
 
 from __future__ import annotations
@@ -16,11 +17,11 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
-import anthropic
 import inngest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kb.agents.prompts import ASK_SYNTHESIZER_SYSTEM_PROMPT
+from kb.agents.providers import call_llm
 from kb.config import settings
 from kb.inngest_client import client
 from kb.retrieval.hybrid import hybrid_search
@@ -29,21 +30,11 @@ from kb.schemas.events import ANSWER_PRODUCED, AnswerProduced
 
 logger = logging.getLogger(__name__)
 
-_anthropic_client: anthropic.AsyncAnthropic | None = None
 # asyncio only keeps weak references to tasks: a fire-and-forget task nobody
 # holds on to can be garbage-collected before it finishes.
 _background_tasks: set[asyncio.Task[None]] = set()
 
 SYSTEM_PROMPT = ASK_SYNTHESIZER_SYSTEM_PROMPT
-
-
-def get_anthropic_client() -> anthropic.AsyncAnthropic | None:
-    global _anthropic_client
-    if not settings.anthropic_api_key:
-        return None
-    if _anthropic_client is None:
-        _anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-    return _anthropic_client
 
 
 def _format_context(passages: list[dict[str, Any]]) -> str:
@@ -85,30 +76,26 @@ def _newest_date(passages: list[dict[str, Any]]) -> datetime | None:
     return max(dates) if dates else None
 
 
-async def _synthesize(
-    llm: anthropic.AsyncAnthropic, question: str, passages: list[dict[str, Any]]
-) -> str:
+async def _synthesize(question: str, passages: list[dict[str, Any]]) -> str:
     prompt = (
         f"Context passages:\n{_format_context(passages)}\n\n"
         f"Question: {question}\n\n"
         "Answer with inline citations:"
     )
     try:
-        response = await llm.messages.create(
+        # /ask never enters an Inngest step, so CostCaptureMiddleware can never see
+        # this call: persist the cost row here or the spend stays invisible.
+        result = await call_llm(
+            system_prompt=SYSTEM_PROMPT,
+            user_input=prompt,
             model=settings.synthesis_model,
             max_tokens=settings.synthesis_max_tokens,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
+            persist_cost=True,
         )
     except Exception as exc:
         logger.exception("LLM synthesis failed")
         return f"LLM synthesis failed ({type(exc).__name__}): {exc}"
-    texts = [
-        block.text
-        for block in response.content
-        if getattr(block, "type", None) == "text" and hasattr(block, "text")
-    ]
-    return "\n\n".join(texts)
+    return str(result["output"])
 
 
 async def _emit_answer_produced(snapshot_id: str, retriever_variant: str) -> None:
@@ -139,19 +126,12 @@ async def ask_question(
         session, query=question, limit=limit or settings.retrieval_limit
     )
 
-    # 2. Answer with Claude, citing passages as [1], [2], ...
-    llm = get_anthropic_client()
+    # 2. Answer with the configured synthesis model, citing passages as [1], [2], ...
     if not top_passages:
         answer_text = "No relevant passages were found in the knowledge base for this question."
         citations: list[dict[str, Any]] = []
-    elif llm is None:
-        answer_text = (
-            f"Retrieved {len(top_passages)} relevant passages with hybrid search. "
-            "Set ANTHROPIC_API_KEY to get an answer with inline citations."
-        )
-        citations = [_citation(i, p) for i, p in enumerate(top_passages, start=1)]
     else:
-        answer_text = await _synthesize(llm, question, top_passages)
+        answer_text = await _synthesize(question, top_passages)
         # Only the passages the model actually cited become citations.
         citations = [
             _citation(i, p) for i, p in enumerate(top_passages, start=1) if f"[{i}]" in answer_text

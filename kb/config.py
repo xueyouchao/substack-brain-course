@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+from typing import Any, Literal
+
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _is_blank(value: object) -> bool:
+    return isinstance(value, str) and not value.strip()
 
 
 class Settings(BaseSettings):
@@ -96,6 +102,58 @@ class Settings(BaseSettings):
     digest_cron: str = "0 8 * * 1"
     digest_lookback_days: int = 7
     digest_max_tokens: int = 2048
+
+    # --- Model provider routing (docs/model-provider-config.md) ---
+    # Any *_MODEL above may carry an explicit "provider:" prefix. A bare model
+    # name falls back to this provider, so an .env that only sets
+    # ANTHROPIC_API_KEY keeps working with no edit.
+    default_provider: str = "anthropic"
+    # Empty means "let the Anthropic SDK choose its own endpoint"; set it to
+    # aim the anthropic_messages transport at any compatible gateway.
+    anthropic_base_url: str = ""
+    openai_base_url: str = "https://api.openai.com/v1"
+    # Any OpenAI-compatible gateway is reachable as "openai:<model>" plus this
+    # base_url, so the row needs the same two downgrade knobs as Ollama/OpenCode:
+    # a proxy that ignores response_format, or bills a flat rate, must be an env
+    # change and not a code change. Defaults match docs §4 (native / per_token).
+    openai_structured_output: Literal["native", "json_mode", "prompt_only"] = "native"
+    openai_pricing_mode: Literal["per_token", "subscription", "unknown"] = "per_token"
+    # Ollama Cloud serves both API families from one key, so the two families
+    # need separate hosts instead of sharing a single base_url.
+    # For a local Ollama, point ollama_base_url at http://localhost:11434/v1
+    # and give ollama_api_key any non-empty value: it is ignored there.
+    ollama_base_url: str = "https://ollama.com/v1"
+    ollama_anthropic_base_url: str = "https://ollama.com"
+    ollama_api_key: str = ""
+    # Literal rather than str: a typo must fail at startup, not silently
+    # downgrade structured output to free-form prose per request.
+    ollama_structured_output: Literal["native", "json_mode", "prompt_only"] = "json_mode"
+    ollama_pricing_mode: Literal["per_token", "subscription", "unknown"] = "unknown"
+    # Same two-family split as Ollama: OpenCode Console routes Claude models to
+    # Anthropic Messages and the rest to Chat Completions, and both families
+    # share OPENCODE_API_KEY, so the user only ever configures one key.
+    opencode_base_url: str = "https://opencode.ai/inference/openai/v1"
+    opencode_anthropic_base_url: str = "https://opencode.ai/inference/anthropic"
+    opencode_api_key: str = ""
+    opencode_structured_output: Literal["native", "json_mode", "prompt_only"] = "prompt_only"
+    opencode_pricing_mode: Literal["per_token", "subscription", "unknown"] = "subscription"
+    # The Go subscription ingress (…/inference/go/openai/v1) answers
+    # 400 MissingSessionID unless the request carries x-opencode-session. Blank
+    # means "generate one per process": that satisfies the routing hint without
+    # asking the user to invent an id.
+    opencode_session: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _treat_blank_as_unset(cls, data: Any) -> Any:
+        # `cp .env.example .env` leaves lines like `OLLAMA_BASE_URL=` behind, and a
+        # blank assignment is nobody's intent: keep it, and it silently wipes a
+        # non-empty default (or, for a Literal field, refuses to start at all
+        # because "" is not a valid tier). Dropping the key here lets the field
+        # default apply, in one place, for env vars and .env files alike.
+        if not isinstance(data, dict):
+            return data
+        return {key: value for key, value in data.items() if not _is_blank(value)}
 
     @field_validator("digest_cron", mode="before")
     @classmethod
